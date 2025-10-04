@@ -72,22 +72,35 @@ class WithdrawController extends Controller
             );
         }
 
-        // If you want to handle the case when the balance is sufficient, add your logic here.
-        // For now, there is no else/other case.
+        try {
+            // Process all transactions in the batch
+            $results = $this->processWithdrawTransactions($request);
 
-        // Process all transactions in the batch
-        $results = $this->processWithdrawTransactions($request);
+            // Log the overall batch request and its final outcome
+            // This provides an audit trail for the entire webhook call
+            try {
+                \App\Models\TransactionLog::create([ // Use full namespace to avoid alias conflict if any
+                    'type' => 'withdraw',
+                    'batch_request' => $request->all(),
+                    'response_data' => $results,
+                    'status' => collect($results)->every(fn ($r) => $r['code'] === SeamlessWalletCode::Success->value) ? 'success' : 'partial_success_or_failure',
+                ]);
+            } catch (\Exception $e) {
+                Log::warning('Failed to create TransactionLog', ['error' => $e->getMessage()]);
+                // Don't fail the entire request if logging fails
+            }
 
-        // Log the overall batch request and its final outcome
-        // This provides an audit trail for the entire webhook call
-        \App\Models\TransactionLog::create([ // Use full namespace to avoid alias conflict if any
-            'type' => 'withdraw',
-            'batch_request' => $request->all(),
-            'response_data' => $results,
-            'status' => collect($results)->every(fn ($r) => $r['code'] === SeamlessWalletCode::Success->value) ? 'success' : 'partial_success_or_failure',
-        ]);
-
-        return ApiResponseService::success($results);
+            return ApiResponseService::success($results);
+        } catch (\Exception $e) {
+            Log::error('Withdraw API Error', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            
+            // Return a proper error response instead of letting it become a 500
+            return ApiResponseService::error(
+                SeamlessWalletCode::InternalServerError,
+                'Internal server error occurred',
+                ['error' => $e->getMessage()]
+            );
+        }
     }
 
     /**
@@ -118,14 +131,14 @@ class WithdrawController extends Controller
             // Handle batch-level errors (invalid signature or currency)
             if (! $isValidSign) {
                 Log::warning('Invalid signature for batch', ['member_account' => $memberAccount, 'provided' => $request->sign, 'expected' => $expectedSign]);
-                $responseData[] = $this->buildErrorResponse($memberAccount, $productCode, 0.0, SeamlessWalletCode::InvalidSignature, 'Invalid signature', $request->currency);
+                $responseData[] = $this->buildErrorResponse($memberAccount ?? 'unknown', $productCode ?? 0, 0.0, SeamlessWalletCode::InvalidSignature, 'Invalid signature', $request->currency);
 
                 continue;
             }
 
             if (! $isValidCurrency) {
                 Log::warning('Invalid currency for batch', ['member_account' => $memberAccount, 'currency' => $request->currency]);
-                $responseData[] = $this->buildErrorResponse($memberAccount, $productCode, 0.0, SeamlessWalletCode::InternalServerError, 'Invalid Currency', $request->currency);
+                $responseData[] = $this->buildErrorResponse($memberAccount ?? 'unknown', $productCode ?? 0, 0.0, SeamlessWalletCode::InternalServerError, 'Invalid Currency', $request->currency);
 
                 continue;
             }
@@ -384,8 +397,8 @@ class WithdrawController extends Controller
     private function buildErrorResponse(string $memberAccount, string|int $productCode, float $balance, SeamlessWalletCode $code, string $message, string $currency): array
     {
         return [
-            'member_account' => $memberAccount,
-            'product_code' => (int) $productCode, // Ensure it's an int
+            'member_account' => $memberAccount ?? 'unknown',
+            'product_code' => (int) ($productCode ?? 0), // Ensure it's an int
             'before_balance' => $this->formatBalance($balance, $currency),
             'balance' => $this->formatBalance($balance, $currency),
             'code' => $code->value,
